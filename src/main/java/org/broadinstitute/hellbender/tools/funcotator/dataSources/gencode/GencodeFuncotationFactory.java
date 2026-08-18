@@ -242,6 +242,11 @@ public class GencodeFuncotationFactory extends DataSourceFuncotationFactory {
      */
     private boolean isSegmentFuncotationEnabled;
 
+    /**
+     * If this is true, only MANE transcripts will be used for funcotation creation when at least one is present.
+     */
+    private boolean preferMANETranscripts;
+
     //==================================================================================================================
     // Constructors:
 
@@ -354,7 +359,7 @@ public class GencodeFuncotationFactory extends DataSourceFuncotationFactory {
 
         this(gencodeTranscriptFastaFilePath, version, name, transcriptSelectionMode, userRequestedTranscripts,
                 annotationOverrides, mainFeatureInput, flankSettings, isDataSourceB37, ncbiBuildVersion,
-                isSegmentFuncotationEnabled, minBasesForValidSegment, FuncotatorUtils.DEFAULT_SPLICE_SITE_WINDOW_SIZE);
+                isSegmentFuncotationEnabled, minBasesForValidSegment, FuncotatorUtils.DEFAULT_SPLICE_SITE_WINDOW_SIZE, false);
     }
 
     /**
@@ -385,7 +390,8 @@ public class GencodeFuncotationFactory extends DataSourceFuncotationFactory {
                                      final String ncbiBuildVersion,
                                      final boolean isSegmentFuncotationEnabled,
                                      final int minBasesForValidSegment,
-                                     final int spliceSiteWindowSize) {
+                                     final int spliceSiteWindowSize,
+                                     final boolean preferMANETranscriptsWhereApplicable) {
 
         super(mainFeatureInput, minBasesForValidSegment);
 
@@ -419,7 +425,7 @@ public class GencodeFuncotationFactory extends DataSourceFuncotationFactory {
         }
 
         // Set our comparator for outputting our funcotations in the right order with the correct "best" transcript:
-        gencodeFuncotationComparator = transcriptSelectionMode.getComparator(userRequestedTranscripts);
+        gencodeFuncotationComparator = transcriptSelectionMode.getComparator(userRequestedTranscripts, preferMANETranscriptsWhereApplicable);
 
         // Initialize segment metadata.  This will only be used if funcotating segments.  If we are not doing that create
         //  an empty set of metadata for segments.
@@ -429,6 +435,8 @@ public class GencodeFuncotationFactory extends DataSourceFuncotationFactory {
 
         // Initialize overrides / defaults:
         initializeAnnotationOverrides( annotationOverrides );
+
+        this.preferMANETranscripts = preferMANETranscriptsWhereApplicable;
     }
 
     private Path localizeGencodeTranscriptFastaFile( final Path gencodeTranscriptFastaFilePath ) {
@@ -622,6 +630,27 @@ public class GencodeFuncotationFactory extends DataSourceFuncotationFactory {
                         .collect(Collectors.toList());
     }
 
+    /**
+     * Return all MANE transcripts (Select and Plus Clinical) that contain the variant along with the basic transcripts.
+     * Let base Funcotator transcript selection do the rest based on whether MANE is preferred or not.
+     * If there are no MANE transcripts covering the current variant, this would still return the basic transcripts.
+     * @param transcripts of GENCODE transcripts to possibly filter
+     * @return List of MANE and/or basic transcripts
+     */
+    @VisibleForTesting
+    static List<GencodeGtfTranscriptFeature> retrieveMANEAndBasicTranscripts(final VariantContext variant, final List<GencodeGtfTranscriptFeature> transcripts) {
+        final List<GencodeGtfTranscriptFeature> maneSelectAndPlusClinical = transcripts.stream().filter(g -> (hasTag(g, MANE_SELECT) || hasTag(g, MANE_PLUS_CLINICAL)) && g.contains(variant)).toList();
+
+        List<GencodeGtfTranscriptFeature> transcriptsToReturn = transcripts.stream().filter(GencodeFuncotationFactory::isBasic).collect(Collectors.toList());
+
+        for(GencodeGtfTranscriptFeature transcript : maneSelectAndPlusClinical) {
+            if(!transcriptsToReturn.contains(transcript)) {
+                transcriptsToReturn.add(transcript);
+            }
+        }
+
+        return transcriptsToReturn;
+    }
 
     /**
      * {@inheritDoc}
@@ -852,15 +881,26 @@ public class GencodeFuncotationFactory extends DataSourceFuncotationFactory {
      *         Will be an empty List if the variant was in the IGR for all transcripts.
      */
     private List<GencodeFuncotation> createFuncotationsHelper(final VariantContext variant, final Allele altAllele, final GencodeGtfGeneFeature gtfFeature, final ReferenceContext reference) {
+        List<GencodeGtfTranscriptFeature> transcriptList;
 
-        final List<GencodeGtfTranscriptFeature> transcriptList;
-
-        // Only get basic transcripts if we're using data from Gencode:
-        if ( gtfFeature.getGtfSourceFileType().equals(GencodeGtfCodec.GTF_FILE_TYPE_STRING) ) {
-            transcriptList = retrieveBasicTranscripts(gtfFeature);
+        if(gtfFeature.getGtfSourceFileType().equals(GencodeGtfCodec.GTF_FILE_TYPE_STRING)) {
+            if(preferMANETranscripts) {
+                transcriptList = retrieveMANEAndBasicTranscripts(variant, gtfFeature.getTranscripts());
+            }
+            else {
+                transcriptList = retrieveBasicTranscripts(gtfFeature);
+            }
         }
         else {
-            transcriptList = gtfFeature.getTranscripts();
+            // GENCODE GRCh37 liftover GTF files (>=v43) are in ENSEMBL format
+            // We still want to be able to use MANE transcripts with the hg19 data source, hence the condition below
+            if(preferMANETranscripts && gtfFeature.getGtfSourceFileType().equals(EnsemblGtfCodec.GTF_FILE_TYPE_STRING))
+            {
+                transcriptList = retrieveMANEAndBasicTranscripts(variant, gtfFeature.getTranscripts());
+            }
+            else {
+                transcriptList = gtfFeature.getTranscripts();
+            }
         }
 
         return createFuncotationsHelper(variant, altAllele, reference, transcriptList);
@@ -972,6 +1012,9 @@ public class GencodeFuncotationFactory extends DataSourceFuncotationFactory {
 
         gencodeFuncotationBuilder.setVariantClassification(GencodeFuncotation.VariantClassification.COULD_NOT_DETERMINE);
 
+        // Needed for some special cases to know whether this is a MANE transcript
+        gencodeFuncotationBuilder.setManeTranscript(hasTag(transcript, MANE_SELECT) || hasTag(transcript, MANE_PLUS_CLINICAL));
+
         gencodeFuncotationBuilder.setDataSourceName(dataSourceName);
 
         return gencodeFuncotationBuilder.build();
@@ -979,9 +1022,14 @@ public class GencodeFuncotationFactory extends DataSourceFuncotationFactory {
 
     private static boolean isBasic(final GencodeGtfTranscriptFeature transcript) {
         // Check if this transcript has the `basic` tag:
+        return hasTag(transcript, GencodeGTFFieldConstants.FeatureTag.BASIC);
+    }
+
+    private static boolean hasTag(final GencodeGtfTranscriptFeature transcript, final GencodeGTFFieldConstants.FeatureTag tag) {
+        // Check if this transcript has the given tag:
         return transcript.getOptionalFields().stream()
                 .filter( f -> f.getName().equals("tag") )
-                .filter( f -> f.getValue().equals(GencodeGTFFieldConstants.FeatureTag.BASIC.toString()) )
+                .filter( f -> f.getValue().equals(tag.toString()) )
                 .count() > 0;
     }
 
@@ -1181,6 +1229,9 @@ public class GencodeFuncotationFactory extends DataSourceFuncotationFactory {
         // Set the VariantClassification through a simple equivalency on the gene type (since we have no transcript info):
         gencodeFuncotationBuilder.setVariantClassification( convertGeneTranscriptTypeToVariantClassification(exon.getGeneType()) );
 
+        // Needed for some special cases to know whether this is a MANE transcript
+        gencodeFuncotationBuilder.setManeTranscript(hasTag(transcript, MANE_SELECT) || hasTag(transcript, MANE_PLUS_CLINICAL));
+
         // Set our data source name:
         gencodeFuncotationBuilder.setDataSourceName(getName());
 
@@ -1322,6 +1373,9 @@ public class GencodeFuncotationFactory extends DataSourceFuncotationFactory {
             // We should have sequence information but we don't... this is not good, but we have to put something here:
             gencodeFuncotationBuilder.setVariantClassification( convertGeneTranscriptTypeToVariantClassification(exon.getGeneType()) );
         }
+
+        // Needed for some special cases to know whether this is a MANE transcript
+        gencodeFuncotationBuilder.setManeTranscript(hasTag(transcript, MANE_SELECT) || hasTag(transcript, MANE_PLUS_CLINICAL));
 
         // Set our data source name:
         gencodeFuncotationBuilder.setDataSourceName(getName());
@@ -1704,6 +1758,9 @@ public class GencodeFuncotationFactory extends DataSourceFuncotationFactory {
             gencodeFuncotationBuilder.setVariantClassification(GencodeFuncotation.VariantClassification.THREE_PRIME_UTR);
         }
 
+        // Needed for some special cases to know whether this is a MANE transcript
+        gencodeFuncotationBuilder.setManeTranscript(hasTag(transcript, MANE_SELECT) || hasTag(transcript, MANE_PLUS_CLINICAL));
+
         // Set our version:
         gencodeFuncotationBuilder.setVersion(version);
 
@@ -1782,6 +1839,9 @@ public class GencodeFuncotationFactory extends DataSourceFuncotationFactory {
                         strandCorrectedAltAllele.getBaseString()
                 )
         );
+
+        // Needed for some special cases to know whether this is a MANE transcript
+        gencodeFuncotationBuilder.setManeTranscript(hasTag(transcript, MANE_SELECT) || hasTag(transcript, MANE_PLUS_CLINICAL));
 
         // Set our version:
         gencodeFuncotationBuilder.setVersion(version);
@@ -2574,7 +2634,8 @@ public class GencodeFuncotationFactory extends DataSourceFuncotationFactory {
                 .setReferenceContext(referenceBasesString)
                 .setGcContent(gcContent)
                 .setNcbiBuild(ncbiBuildVersion)
-                .setGeneTranscriptType(transcript.getTranscriptType());
+                .setGeneTranscriptType(transcript.getTranscriptType())
+                .setManeTranscript(hasTag(transcript, MANE_SELECT) || hasTag(transcript, MANE_PLUS_CLINICAL));
 
         // Set our version:
         funcotationBuilder.setVersion(version);
@@ -2646,8 +2707,11 @@ public class GencodeFuncotationFactory extends DataSourceFuncotationFactory {
 
         final StrandCorrectedReferenceBases referenceBases = FuncotatorUtils.getBasesInWindowAroundReferenceAllele(variant.getReference(), reference, Strand.POSITIVE, referenceWindow);
 
-        // Set our reference context in the the FuncotatonBuilder:
+        // Set our reference context in the FuncotationBuilder:
         funcotationBuilder.setReferenceContext( referenceBases.getBaseString() );
+
+        // Needed for some special cases to know whether this is a MANE transcript
+        funcotationBuilder.setManeTranscript(hasTag(annotationTranscript, MANE_SELECT) || hasTag(annotationTranscript, MANE_PLUS_CLINICAL));
 
         // Set our version:
         funcotationBuilder.setVersion(version);
@@ -2707,8 +2771,11 @@ public class GencodeFuncotationFactory extends DataSourceFuncotationFactory {
 
         final StrandCorrectedReferenceBases referenceBases = FuncotatorUtils.getBasesInWindowAroundReferenceAllele(variant.getReference(), reference, Strand.POSITIVE, referenceWindow);
 
-        // Set our reference context in the the FuncotatonBuilder:
+        // Set our reference context in the FuncotationBuilder:
         funcotationBuilder.setReferenceContext(referenceBases.getBaseString(Strand.POSITIVE));
+
+        // Needed for some special cases to know whether this is a MANE transcript
+        funcotationBuilder.setManeTranscript(hasTag(annotationTranscript, MANE_SELECT) || hasTag(annotationTranscript, MANE_PLUS_CLINICAL));
 
         // Set our version:
         funcotationBuilder.setVersion(version);
